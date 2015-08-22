@@ -1,0 +1,326 @@
+---
+title: "Practical Machine Learning Class Project"
+author: "Al Gee"
+date: "August 21, 2015"
+output: html_document
+---
+
+```{r, echo = FALSE}
+# 1) Has the student submitted a github repo?
+# 2) Do the authors describe what they expect the out of sample error to be and estimate the error appropriately with cross-validation?
+# 3) As far as you can determine, does it appear that the work submitted for this project is the work of the student who submitted it? 
+```
+
+```{r, results="hide", warn.conflicts = FALSE, message = FALSE, echo = FALSE}
+library(caret)
+library(ggplot2)
+library(rattle)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(kernlab)
+library(knitr)
+```
+
+```{r, echo = FALSE}
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+  
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+  
+  numPlots = length(plots)
+  
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                     ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+  
+  if (numPlots==1) {
+    print(plots[[1]])
+    
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+    
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+## **Executive Summary**
+This is a project for the Coursera class "Practical Machine Learning" [1]. The authors of a study on human activity recognition [2] have generously made available their dataset [3] to the public. As in the original study, the objective of this project is to use this exercise dataset to develop a machine learning model which can predict, from various sensor readings, whether the exercise is being performed correctly or not. The specific exercise focused on in the study was the "Unilateral Dumbbell Biceps Curl".
+
+The results show that it is possible to develop a parsimonious model which can accurately predict (98%) if an exercise is being performed correctly. In addition, if the activity is not being performed correctly, the model can correctly identify (98%) several classes of common mistakes being made.
+
+Finally, in the conclusion, suggestions are provided to the original authors on how they might improve the original study.
+
+## **References**
+[1] "Practical Machine Learning", Prof. Jeff Leek of the John Hopkins Bloomberg School of Public Health (August 2015)
+
+[2] Velloso, E., Bulling, A., Gellersen, H., Ugulino, W., Fuks, H., "Qualitative Activity Recognition of Weight Lifting Exercises",  Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13). Stuttgart, Germany: ACM SIGCHI, 2013.
+
+[3] http://groupware.les.inf.puc-rio.br/static/WLE/WearableComputing_weight_lifting_exercises_biceps_curl_variations.csv
+
+## **Exploratory Data Analysis**
+
+The first exploratory task was to get an understanding of the raw data. The raw data is collected from sensor locations on the "belt", "arm", "forearm", and "dumbbell". At each location there were "gyros", "magnet" , and "accel" sensors recording motion in 3 degrees of freedom ("x", "y", and "z"). This yielded a total of 36 raw measurement variables. From these raw variables, a set of basic variables are derived: "roll", "pitch", "yaw", and "total_accel"; combined with the raw variables, these form a total of 52 fundamental variables.
+
+The next step in the exploratory stage sorts the fundamental variables by time by combining the raw_timestamp_part_1 and raw_timestamp_part_2 variables. The units were determined empirically to be seconds and microseconds, respectively. The fundamental variables were then manually plotted as a function of time (note: time between participants was artificially compressed to 10 seconds for display purposes). As will be seen, this is equivalent to plotting by participant and exercise method.
+
+
+```{r, echo = FALSE}
+dTrain = read.csv("pml-training.csv")  # data.frame:	19622 obs. of 160 variables
+dTest = read.csv("pml-testing.csv")    # data.frame':	20 obs. of 160 variables
+predName = colnames(dTrain)
+userName = levels(dTrain$user_name)
+cOut = levels(dTrain$classe)
+
+dTrain$time_s = dTrain$raw_timestamp_part_1 + dTrain$raw_timestamp_part_2 * 1e-6  # seconds
+dTest$time_s = dTest$raw_timestamp_part_1 + dTest$raw_timestamp_part_2 * 1e-6     # seconds
+
+d=predName[apply(apply(dTest,2,is.na),2,all)==FALSE] # 61 observations
+rawPred=d[
+  grepl("_belt",d) |
+  grepl("_arm",d) |
+  grepl("_forearm",d) | 
+  grepl("_dumbbell",d)
+] # 52 raw predictors = 13 (4+3+3+3) x 4(belt, arm, forearm, dumbbell)
+
+d=rawPred
+omit=grepl("roll",d) |
+  grepl("pitch",d) |
+  grepl("yaw",d) | 
+  grepl("total",d)
+
+level1Pred = rawPred[omit]
+rawPred = rawPred[!omit]
+fundPred = c(rawPred,level1Pred)
+```
+
+```{r, echo = FALSE}
+# sort by time
+
+dTrainPrime=NULL
+dTestPrime=dTest[,c("user_name",rawPred,"time_s","problem_id")]
+
+bStart=0;
+for (kn in 1:length(userName)) {
+  
+  bTrain=dTrain[dTrain$user_name == userName[kn],]
+  bTrain=bTrain[order(bTrain$time_s),]
+  tMin_s = min(bTrain$time_s)
+  bTrain$time_s=bTrain$time_s - tMin_s + bStart[kn]
+  
+  dTestPrime$time_s[dTest$user_name == userName[kn]] = dTestPrime$time_s[dTest$user_name == userName[kn]] - tMin_s + bStart[kn]
+  dTrainPrime=rbind(dTrainPrime,bTrain)
+  
+  bStart[kn+1] = max(bTrain$time_s)+10
+  
+}
+
+
+# manually step through raw variables
+
+# for (k in 1:length(rawPred)) {
+#   ss=rawPred[k]
+#   p = ggplot(dTrainPrime, aes_string(x="time_s", y=ss, color="classe")) +
+#     geom_point(size = 2) +
+#     scale_color_discrete(name="class") +
+#     theme_grey(base_size = 10) +
+#     labs(x="time, s", y=ss) 
+#   print(p)
+#   readline("Continue ? [Y/n]") 
+# }
+
+# manually step through level 1 variables
+
+# for (k in 1:length(level1Pred)) {
+#   ss=level1Pred[k]
+#   p = ggplot(dTrainPrime, aes_string(x="time_s", y=ss, color="classe")) +
+#     geom_point(size = 2) +
+#     scale_color_discrete(name="class") +
+#     theme_grey(base_size = 10) +
+#     labs(x="time, s", y=ss) 
+#   print(p)
+#   readline("Continue ? [Y/n]") 
+# }
+
+dbad=c("user_name","gyros_dumbbell_y","accel_arm_x","roll_forearm","accel_belt_z")
+
+plots <- list()  # new empty list
+for (k in 1:length(dbad)) {
+  ss=dbad[k]
+  p = ggplot(dTrainPrime, aes_string(x="time_s", y=ss, color="classe")) +
+      geom_point(size = 0.75) +
+      scale_color_discrete(name="class") +
+      theme_grey(base_size = 8) +
+      labs(x="time, s", y=ss) 
+  plots[[k]] <- p
+}
+
+multiplot(plotlist = plots, cols = 2)
+
+
+```
+
+This step is particularly enlightening. It showed a potential major flaw in the design of the experiment as well as a number of defects in the fundamental dataset. In particular:  
+
+1. The order in which the exercises were done was fixed, with the correct method done first, followed by the incorrect methods. This is shown in the top left plot with the method classified by color. One can easily imagine that the "start up transients" when beginning the first exercise (whether it be the correct or incorrect method) might affect the measurement data. A possible example of this is shown in the bottom left plot where one sees the initial readings of the orange dots are much different than their final readings. The readings of the following exercises (olive, green, blue, purple) are much more uniform with time.  
+
+2. In a number of cases, there were bad data samples (large outliers) in the raw dataset. An example of this is shown in the middle left plot.
+
+3. Although, raw sensor data was collected for every participant, a number of derived basic variables were missing for some participants. An example of this is shown in the top right plot (for adelmo).  
+
+4. For the derived variables (like "roll"), a number of them show a data "wrapping" error. The data exceeds the data range allocated to the variable. An example of this is shown in the top right plot (for carlitos, eurico, jeremy, and pedro). Carlitos numbers should probably be between 125 and 225.
+
+5. Some sensor readings have an apparent large offset between participants. An example of this is shown in the middle right plot.
+
+There were a number of other errors in the dataset, but the ones above are examples of the more egregious ones. In addition to the fundamental variables, the dataset set includes additional derived variables based on the statistics of the fundamental variables (over various time windows).
+
+
+For the purpose of this assignment, the poor quality of the dataset will be ignored with the understanding that any conclusions based on this uncorrected dataset should be considered suspect.
+
+#### **Project Assignment**
+Note that since "time" is provided as predictor for the Prediction Assignment, the class can easily be determined with this variable alone. Training a random forest model with this variable alone yields the Predicition Assignment answer: [B A B A A E D B A A B C B A E E A B B B] 
+
+```{r}
+# modFitTime = train(classe ~ time_s, data = dTrainPrime[,c("time_s","classe")], method = "rf")
+# save(modFitTime,file = "final_modFitTime")
+load("final_modFitTime")
+predict(modFitTime, newdata = dTestPrime)
+```
+
+
+## **Main Analysis**
+
+As usual for machine learning, the dataset is initially partitioned into a training set (75%) and test set (25%).
+
+As a first cut, all the fundamental variables (described above) are used as predictors. Note that this does not include the "user_name" and "time" variables (as seen above, the "time" variable by itself will ensure 100% accuracy). The random forest method is arbitrarily chosen.
+
+```{r}
+set.seed(123)
+
+d=dTrain[,c(fundPred,"classe")]
+inTrain = createDataPartition(y=d$classe, p=0.75, list=FALSE)
+training = d[inTrain,]
+testing = d[-inTrain,]
+training$classe = as.numeric(training$classe)
+testing$classe = as.numeric(testing$classe)
+preProcObj = preProcess(training , method = c("center", "scale"))
+
+zTraining = predict(preProcObj, training)
+zTraining$classe = as.factor(cOut[(zTraining$classe*preProcObj$std["classe"]+preProcObj$mean["classe"])])
+
+zTest = predict(preProcObj, testing)
+zTest$classe = as.factor(cOut[(zTest$classe*preProcObj$std["classe"]+preProcObj$mean["classe"])])
+
+set.seed(456)
+
+# procTimeStart = proc.time()
+# modFit = train(classe ~ ., data = zTraining, method = "rf")
+# elapseTime = proc.time() - procTimeStart # 2838.10 16.00 6216.27/3600 => 1.73 hrs
+# 
+# save(modFit,file = "final_modFit")
+load(file = "final_modFit")
+
+testPredict = predict(modFit, newdata = zTest)
+confusionMatrix(testPredict, zTest$classe)
+```
+
+
+Since the error is so low, perhaps a parsimonious model can be found with acceptable error. To this end, the varImp routine is used to determine the predictors with the highest importance.
+```{r}
+plot(varImp(modFit))
+```
+
+For the next model attempt, only the top 7 predictors are used. These are: "roll_belt", "yaw_belt", "magnet_dumbbell_z", "magnet_dumbbell_y", "pitch_belt", "pitch_forearm", and  "roll_forearm".
+
+```{r}
+cSparse=c("roll_belt","yaw_belt","magnet_dumbbell_z","magnet_dumbbell_y","pitch_belt","pitch_forearm","roll_forearm")
+
+zSparseTrain = zTraining[,c(cSparse,"classe")]
+zSparseTest = zTest[,c(cSparse,"classe")]
+
+set.seed(456)
+
+# procTimeStart = proc.time()
+# modFitSparse = train(classe ~ ., data = zSparseTrain, method = "rf")
+# elapseTime = proc.time() - procTimeStart # 465.34   16.56  482.18/60 =>  8.0363 min
+#
+# save(modFitSparse,file = "final_modFitSparse")
+load("final_modFitSparse")
+
+testPredict = predict(modFitSparse, newdata = zSparseTest)
+confusionMatrix(testPredict, zSparseTest$classe)
+```
+
+With only 7 fundamental predictors, there is very little loss in accuracy as compared to the model using all 52 fundamental predictors. The overall accuracy is 98.8% versus 99.3%, respectively.
+
+For a final model, cross-validation with 10 folds repeated 10 times is used with the parsimonious predictors.
+
+```{r}
+fitControl = trainControl(method = "repeatedcv", number = 10, repeats = 10)
+
+set.seed(456)
+
+# procTimeStart = proc.time()
+# modFitCV = train(classe ~ ., data = zSparseTrain, method = "rf", trControl = fitControl)
+# elapseTime = proc.time() - procTimeStart # 1665.70    56.43 12030.13/3600 =>  3.341703 hr
+# 
+# save(modFitCV,file = "final_modFitCV")
+load("final_modFitCV")
+
+testPredict = predict(modFitCV, newdata = zSparseTest)
+confusionMatrix(testPredict, zSparseTest$classe)
+```
+
+This model yields 98.7% overall accuracy. 
+
+Overall, the expected out of sample error is less than 2%.
+
+#### **Project Assignment**
+
+All three models give the same answer as the one given by the simple time model in the *Exploratory Data Analysis* section.
+
+```{r}
+d=dTest[,c(fundPred)]
+d$classe = 1
+zHW = predict(preProcObj, d)
+predict(modFit, newdata = zHW)  # B A B A A E D B A A B C B A E E A B B B
+predict(modFitSparse, newdata = zHW[,cSparse])
+predict(modFitCV, newdata = zHW[,cSparse])
+```
+
+
+## **Conclusion**
+
+With the R caret package it is remarkably easy to use machine learning techniques. Using the dataset provided for this class project, one can predict, with a 98% accuracy, the outcome with a model using as few as 7 fundamental predictors.
+
+As discussed in the *Exploratory Data Analysis* section, there are many flaws in the dataset. It is recommended to the original authors that:
+
+1. The order of the exercises be randomized. For instance, one sequence might be {A,B,C,D,E} and another {B,D,E,A,C}. This could avoid confounding issues related to starting the first exercise slowly or tiring on the last exercise.
+
+2. Check the raw data and derived data. For instance, the data wrapping error is egregious.
+
+3. Look at the frequency content or spatial path of the signal in lieu of, say variance, of the signal. The variation of a sensor reading (over time) for 2 different paths could be the same; whereas the path could distinguish between incorrect and correct motion. 
+
+
+
+
+
+
+
+
+
